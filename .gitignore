@@ -1,0 +1,53 @@
+# ── Environment & Secrets ──────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Generated output files (runtime artifacts, not source) ────────────────────
+backend/llms.txt
+backend/agent-map.json
+
+# ── Node / Next.js ─────────────────────────────────────────────────────────────
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+*.tsbuildinfo
+frontend/next-env.d.ts
+
+# ── Database ───────────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+postgres_data/
+
+# ── OS ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Docker ─────────────────────────────────────────────────────────────────────
+*.log
