@@ -8,6 +8,7 @@ The key insight: don't dump all page text — extract specific, high-signal fiel
 that an LLM can quickly reason about.
 """
 
+import json
 import re
 import logging
 from typing import Optional
@@ -57,12 +58,13 @@ NOISE_TAGS = [
 ]
 
 PRICE_PATTERNS = [
-    r"\$[\d,]+\.?\d*",
-    r"USD\s*[\d,]+\.?\d*",
-    r"[\d,]+\.?\d*\s*USD",
-    r"£[\d,]+\.?\d*",
-    r"€[\d,]+\.?\d*",
-    r"Price[:\s]+\$?[\d,]+\.?\d*",
+    # Require at least 2 digits to avoid matching "$9" shoe sizes or ratings
+    r"\$[\d,]*\d{2,}\.?\d*",
+    r"USD\s*[\d,]*\d{2,}\.?\d*",
+    r"[\d,]*\d{2,}\.?\d*\s*USD",
+    r"£[\d,]*\d{2,}\.?\d*",
+    r"€[\d,]*\d{2,}\.?\d*",
+    r"Price[:\s]+\$?[\d,]*\d{2,}\.?\d*",
 ]
 
 CTA_KEYWORDS = [
@@ -147,9 +149,21 @@ def scrape_product_page(url: str) -> dict:
     except requests.RequestException as e:
         raise ValueError(f"Could not fetch URL: {e}")
 
+    # ── Layer 1: Shopify JSON API (best quality, no JS needed) ───────────────
+    shopify_data = _try_shopify_json(url, session)
+    if shopify_data:
+        logger.info(f"Extracted via Shopify JSON API: {shopify_data['title']}")
+        return shopify_data
+
     soup = BeautifulSoup(response.text, "lxml")
 
-    # Strip all noise tags first
+    # ── Layer 2: JSON-LD structured data (schema.org Product) ────────────────
+    jsonld_data = _try_jsonld(soup, url)
+    if jsonld_data:
+        logger.info(f"Extracted via JSON-LD: {jsonld_data['title']}")
+        return jsonld_data
+
+    # ── Layer 3: HTML parsing (fallback for non-standard pages) ──────────────
     for tag in soup.find_all(NOISE_TAGS):
         tag.decompose()
 
@@ -160,9 +174,142 @@ def scrape_product_page(url: str) -> dict:
         "description": _extract_description(soup),
         "cta_buttons": _extract_cta_buttons(soup, url),
         "review_snippets": _extract_reviews(soup),
-        # Cap raw text — we don't want to blow the context window
         "raw_text": _get_clean_text(soup)[:5000],
     }
+
+
+def _try_shopify_json(url: str, session: requests.Session) -> Optional[dict]:
+    """
+    Shopify exposes a public JSON API at /products/[handle].json.
+    This returns perfectly structured data without any JS rendering.
+    Works on: Reebok, Allbirds, Gymshark, Skims, thousands of Shopify stores.
+    """
+    parsed = urlparse(url)
+    # Shopify product URLs contain /products/ in the path
+    if "/products/" not in parsed.path:
+        return None
+
+    # Build the JSON endpoint URL
+    # /collections/foo/products/handle → /products/handle.json
+    handle = parsed.path.rstrip("/").split("/products/")[-1].split("?")[0]
+    json_url = f"{parsed.scheme}://{parsed.netloc}/products/{handle}.json"
+
+    try:
+        resp = session.get(json_url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("product", {})
+    except Exception:
+        return None
+
+    if not data:
+        return None
+
+    title = data.get("title", "")
+    if not title:
+        return None
+
+    # Price: use lowest variant price (the "from" price shown on PDP)
+    variants = data.get("variants", [])
+    price = None
+    if variants:
+        prices = [float(v["price"]) for v in variants if v.get("price")]
+        if prices:
+            min_price = min(prices)
+            price = f"${min_price:.2f}" if min_price != int(min_price) else f"${int(min_price)}"
+
+    # Strip HTML from body_html description
+    body_html = data.get("body_html", "")
+    description = BeautifulSoup(body_html, "lxml").get_text(separator=" ", strip=True)[:500]
+
+    # Stock: check if any variant is available
+    available = any(v.get("available", False) for v in variants)
+    stock_status = "in_stock" if available else "out_of_stock"
+
+    # Build clean text for the LLM from all available fields
+    tags = ", ".join(data.get("tags", []))
+    product_type = data.get("product_type", "")
+    raw_text = f"Product: {title}\nType: {product_type}\nTags: {tags}\nDescription: {description}"
+
+    return {
+        "url": url,
+        "title": title,
+        "price": price,
+        "description": description,
+        "cta_buttons": [{"text": "Buy Now", "url": url}],
+        "review_snippets": [],
+        "raw_text": raw_text[:5000],
+        "_source": "shopify_json",
+        "_stock_hint": stock_status,
+    }
+
+
+def _try_jsonld(soup: BeautifulSoup, url: str) -> Optional[dict]:
+    """
+    Many sites embed schema.org Product data as JSON-LD in a <script> tag.
+    This is more reliable than HTML parsing and works pre-JS-render.
+    Common on: Nike, most WordPress/WooCommerce stores, editorial sites.
+    """
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            raw = script.string or ""
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        # Handle both single object and @graph array
+        items = data if isinstance(data, list) else [data]
+        if isinstance(data, dict) and "@graph" in data:
+            items = data["@graph"]
+
+        for item in items:
+            if item.get("@type") not in ("Product", "IndividualProduct"):
+                continue
+
+            title = item.get("name", "")
+            if not title:
+                continue
+
+            # Price from offers
+            price = None
+            offers = item.get("offers", {})
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            raw_price = offers.get("price") or offers.get("lowPrice")
+            currency = offers.get("priceCurrency", "USD")
+            if raw_price:
+                symbol = "$" if currency == "USD" else currency + " "
+                price = f"{symbol}{float(raw_price):.2f}".replace(".00", "")
+
+            # Stock
+            avail = offers.get("availability", "")
+            if "InStock" in avail:
+                stock_hint = "in_stock"
+            elif "OutOfStock" in avail:
+                stock_hint = "out_of_stock"
+            else:
+                stock_hint = "unknown"
+
+            description = item.get("description", "")[:500]
+            brand = ""
+            if isinstance(item.get("brand"), dict):
+                brand = item["brand"].get("name", "")
+
+            raw_text = f"Product: {title}\nBrand: {brand}\nPrice: {price}\nDescription: {description}"
+
+            return {
+                "url": url,
+                "title": title,
+                "price": price,
+                "description": description,
+                "cta_buttons": [{"text": "Buy Now", "url": url}],
+                "review_snippets": [],
+                "raw_text": raw_text[:5000],
+                "_source": "jsonld",
+                "_stock_hint": stock_hint,
+            }
+
+    return None
 
 
 def _extract_title(soup: BeautifulSoup) -> str:

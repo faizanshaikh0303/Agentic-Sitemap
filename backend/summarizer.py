@@ -58,17 +58,22 @@ def summarize_product(scraped_data: dict) -> dict:
     cta_text = json.dumps(scraped_data.get("cta_buttons", []), ensure_ascii=False)
     review_text = json.dumps(scraped_data.get("review_snippets", []), ensure_ascii=False)
 
+    source = scraped_data.get("_source", "html")
+    stock_hint = scraped_data.get("_stock_hint", "")
+    stock_note = f"\nStock Status (verified from API): {stock_hint}" if stock_hint else ""
+
     user_message = f"""Analyze this product page and return the structured JSON summary.
+Data source: {source}{stock_note}
 
 --- PRODUCT PAGE DATA ---
 URL: {scraped_data.get("url", "")}
-Title (from HTML): {scraped_data.get("title", "Not found")}
-Price (from HTML): {scraped_data.get("price", "Not found")}
-Meta Description: {scraped_data.get("description", "Not found")}
+Title: {scraped_data.get("title", "Not found")}
+Price: {scraped_data.get("price", "Not found")}
+Description: {scraped_data.get("description", "Not found")}
 CTA Buttons: {cta_text}
 Customer Reviews: {review_text}
 
-Page Content (truncated):
+Page Content:
 {scraped_data.get("raw_text", "")[:3000]}
 --- END DATA ---
 
