@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from groq import Groq
+from groq import RateLimitError as GroqRateLimitError
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -90,6 +91,7 @@ async def scrape_url(request: ScrapeRequest, db: Session = Depends(get_db)):
     try:
         scraped = scrape_product_page(request.url)
     except ValueError as e:
+        logger.error(f"Scrape failed: {e}")
         raise HTTPException(status_code=422, detail=str(e))
 
     # ── Step 2: Summarize ─────────────────────────────────────────────────────
@@ -224,75 +226,77 @@ async def compare_with_without_context(
 
     # ── Query WITHOUT context ─────────────────────────────────────────────────
     logger.info("Running baseline query (no context)...")
-    resp_without = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful shopping assistant. "
-                    "Answer the user's question about products. "
-                    "You have no specific product catalog — answer from general knowledge."
-                ),
-            },
-            {"role": "user", "content": request.question},
-        ],
-        temperature=0.7,
-        max_tokens=512,
-    )
+    try:
+        resp_without = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful shopping assistant. "
+                        "Answer the user's question about products. "
+                        "You have no specific product catalog — answer from general knowledge."
+                    ),
+                },
+                {"role": "user", "content": request.question},
+            ],
+            temperature=0.7,
+            max_tokens=512,
+        )
+    except GroqRateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Groq rate limit reached: {e}")
     without_answer = resp_without.choices[0].message.content
 
-    # ── Load or generate agent-map ────────────────────────────────────────────
-    agent_map_str = ""
-    if os.path.exists("agent-map.json"):
-        with open("agent-map.json", "r", encoding="utf-8") as f:
-            agent_map_str = f.read()
-    else:
-        # Try to generate on-the-fly from DB
-        products = db.query(Product).all()
-        summaries = [
-            {"product_url": p.url, "summary_data": p.summary.summary_data}
-            for p in products
-            if p.summary
-        ]
-        if summaries:
-            agent_map = generate_agent_map_json(summaries)
-            agent_map_str = json.dumps(agent_map, indent=2)
-
-    if not agent_map_str:
+    # ── Build compact catalog string for the system prompt ────────────────────
+    # Always use live DB data so newly-indexed products are included immediately.
+    # Compact tabular format instead of full JSON to save ~60% tokens.
+    products = db.query(Product).all()
+    summaries = [
+        {"product_url": p.url, "summary_data": p.summary.summary_data}
+        for p in products
+        if p.summary
+    ]
+    if not summaries:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "No indexed products found. "
-                "Scrape some URLs and click 'Generate' first."
-            ),
+            detail="No indexed products found. Scrape some URLs first.",
         )
+
+    agent_map = generate_agent_map_json(summaries)
+    catalog_lines = []
+    for p in agent_map.get("products", []):
+        catalog_lines.append(
+            f"- {p.get('title')} | {p.get('price','?')} | {p.get('best_for_intent','')} | {p.get('why_buy','')} | {p.get('stock_status','unknown')} | {p.get('cta_url','')}"
+        )
+    catalog_str = "\n".join(catalog_lines)
 
     # ── Query WITH context ────────────────────────────────────────────────────
     logger.info("Running agent-first query (with agentic sitemap context)...")
-    system_with_context = f"""You are an intelligent shopping assistant with access to a pre-indexed product catalog.
-Use the catalog below to give precise, actionable answers.
-Always reference specific products, prices, and include the CTA URL so the user can act immediately.
+    system_with_context = f"""You are an intelligent shopping assistant. You have been given a pre-indexed product catalog (an Agentic Sitemap) built from real product pages.
 
-=== PRODUCT CATALOG (agent-map.json) ===
-{agent_map_str[:6000]}
+=== PRODUCT CATALOG ===
+{catalog_str}
 === END CATALOG ===
 
-Rules:
-- Always cite specific product names from the catalog
-- Include prices when known
-- End with a direct link to the recommended product's cta_url
-- If no product matches perfectly, say so clearly"""
+Instructions:
+- Search the catalog first. If one or more products match the user's request, recommend those — cite the exact product name, price, and buy URL so the user can act immediately.
+- If the user states a price limit, only recommend catalog products at or below that price. Never suggest a catalog product that exceeds the stated budget.
+- When multiple catalog products qualify, list all of them.
+- You may use your general knowledge to explain WHY a catalog product fits — but do not recommend products that are not in the catalog.
+- If no catalog product matches, say so clearly and describe what IS available."""
 
-    resp_with = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_with_context},
-            {"role": "user", "content": request.question},
-        ],
-        temperature=0.7,
-        max_tokens=512,
-    )
+    try:
+        resp_with = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_with_context},
+                {"role": "user", "content": request.question},
+            ],
+            temperature=0.7,
+            max_tokens=512,
+        )
+    except GroqRateLimitError as e:
+        raise HTTPException(status_code=429, detail=f"Groq rate limit reached: {e}")
     with_answer = resp_with.choices[0].message.content
 
     # ── Persist comparison ────────────────────────────────────────────────────

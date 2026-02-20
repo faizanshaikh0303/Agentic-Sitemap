@@ -2,11 +2,10 @@
 
 import { useState } from "react";
 
-// Replace with real shoppable product URLs to demo
 const DEMO_URLS = [
-  "https://www.glossier.com/products/boy-brow",
-  "https://www.allbirds.com/products/mens-wool-runners",
-  "https://www.bombas.com/collections/mens-socks",
+  "https://www.nike.com/t/vomero-premium-road-running-shoes-l11miwwa/IQ4035-100",
+  "https://getlivfresh.com/products/dental-gel-toothpaste-wintergreen?_gl=1*aw7tie*_up*MQ..*_gs*MQ..&gclid=Cj0KCQiAqeDMBhDcARIsAJEbU9QEbsECAarMcCPT2diHY2TkcszUVN1wunmo0oBFSuw_gRDnFnTCmF8aAtWBEALw_wcB&gbraid=0AAAAADfS9OBcWOOM8Feni9L9dF_sEstlD",
+  "https://travelpro.com/products/platinum%C2%AE-elite-25-expandable-spinner?variant=19631913992290",
 ];
 
 function safeHostname(url: string): string {

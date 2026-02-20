@@ -8,11 +8,15 @@ The key insight: don't dump all page text — extract specific, high-signal fiel
 that an LLM can quickly reason about.
 """
 
+import asyncio
+import concurrent.futures
 import json
 import re
 import logging
+import sys
+import traceback
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,24 +32,36 @@ PROTECTED_DOMAINS = {
     "reebok.com", "www.reebok.com",
 }
 
-# Strings that indicate a Cloudflare / bot-protection interstitial page.
+# Strings that indicate a bot-protection interstitial page (Cloudflare or Akamai).
 # These pages return HTTP 200 but contain no product data at all — detecting
 # them early prevents silently saving a useless "Unknown" card to the DB.
 _CHALLENGE_MARKERS = [
+    # Cloudflare JS challenge markers
     "cf-browser-verification",
     "cf_chl_opt",
     "cf_chl_prog",
     "__cf_chl_tk__",
     "DDoS protection by Cloudflare",
     "Checking if the site connection is secure",
+    # Akamai Bot Manager markers
+    "_abck",          # Akamai bot cookie — present in block pages
+    "ak_bmsc",        # Akamai cookie injected into block page HTML
+    "akamai-ghost",
+    "Pardon Our Interruption",
 ]
 _CHALLENGE_TITLES = {
+    # Cloudflare titles
     "just a moment",
     "attention required",
     "checking your browser",
     "please wait",
     "security check",
     "one moment, please",
+    # Akamai / generic block titles
+    "access denied",
+    "pardon our interruption",
+    "service unavailable",
+    "forbidden",
 }
 
 # Full Chrome 120 header set — modern browsers send all of these.
@@ -130,51 +146,43 @@ TITLE_SELECTORS = [
 ]
 
 
-def _assert_not_challenge(html: str, domain: str) -> None:
-    """
-    Raise ValueError if the response looks like a bot-protection interstitial.
-    Cloudflare JS challenges return HTTP 200 with no product data — if we don't
-    catch this, all three extraction layers silently return nothing and we save
-    a useless 'Unknown' card to the database.
-    """
-    # Quick marker scan (fast, no parsing needed)
+def _is_challenge_page(html: str) -> bool:
+    """Return True if the response looks like a Cloudflare/bot-protection interstitial."""
     for marker in _CHALLENGE_MARKERS:
         if marker in html:
-            raise ValueError(
-                f"{domain} returned a Cloudflare bot-challenge page (HTTP 200 with "
-                "no product data). The site requires a real browser to pass the "
-                "JavaScript challenge. Use Playwright for this site."
-            )
-
-    # Page title check — parse only the <title> tag, very cheap
+            return True
     title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
     if title_match:
         page_title = title_match.group(1).strip().lower()
         if any(ct in page_title for ct in _CHALLENGE_TITLES):
-            raise ValueError(
-                f"{domain} returned a bot-challenge page titled '{title_match.group(1).strip()}'. "
-                "This site requires JavaScript execution. Use Playwright."
-            )
+            return True
+    return False
 
 
 def scrape_product_page(url: str) -> dict:
     """
     Fetch and parse a product/shoppable page.
     Returns a structured dict with high-signal fields only.
+
+    Extraction order:
+      Protected domains  → Shopify JSON API → Playwright (stealth browser)
+      Normal domains     → Shopify JSON API → JSON-LD → HTML → Playwright on 403/challenge
     """
     domain = urlparse(url).netloc
-    if domain in PROTECTED_DOMAINS:
-        raise ValueError(
-            f"{domain} uses enterprise bot protection (Akamai/Cloudflare) that blocks "
-            "all HTTP scrapers. Use Playwright with a stealth plugin for this site, "
-            "or manually paste the product data."
-        )
 
-    # Session persists cookies across redirects (e.g. consent pages)
     session = requests.Session()
     session.headers.update(HEADERS)
-    # Add a Referer that looks like a Google search referral
     session.headers["Referer"] = "https://www.google.com/"
+
+    # ── Protected domains: Shopify JSON first (no browser), then Playwright ──
+    # These sites block all plain HTTP scrapers; Playwright bypasses that.
+    if domain in PROTECTED_DOMAINS:
+        shopify_data = _try_shopify_json(url, session)
+        if shopify_data:
+            logger.info(f"Shopify JSON bypassed protection for {domain}: {shopify_data['title']}")
+            return shopify_data
+        logger.info(f"{domain} is in PROTECTED_DOMAINS — launching Playwright")
+        return _scrape_with_playwright(url)
 
     try:
         response = session.get(url, timeout=20, allow_redirects=True)
@@ -184,11 +192,9 @@ def scrape_product_page(url: str) -> dict:
     except requests.HTTPError as e:
         status = e.response.status_code
         if status == 403:
-            raise ValueError(
-                f"403 Forbidden — {domain} is blocking automated requests. "
-                "This site likely uses bot protection (Cloudflare, Akamai, etc.). "
-                "Try a different product URL, or use Playwright for JS-heavy sites."
-            )
+            # Hard block — try Playwright before giving up
+            logger.info(f"403 for {domain}, retrying with Playwright")
+            return _scrape_with_playwright(url)
         if status == 429:
             raise ValueError(
                 f"429 Too Many Requests — {domain} is rate-limiting. Wait a moment and retry."
@@ -197,10 +203,10 @@ def scrape_product_page(url: str) -> dict:
     except requests.RequestException as e:
         raise ValueError(f"Could not fetch URL: {e}")
 
-    # ── Challenge page detection (HTTP 200 but no real content) ──────────────
-    # Cloudflare JS challenges return 200 with an interstitial, not product HTML.
-    # Detect before any extraction layer so we fail fast with a clear message.
-    _assert_not_challenge(response.text, domain)
+    # ── Challenge page detection (HTTP 200 but JS interstitial) ──────────────
+    if _is_challenge_page(response.text):
+        logger.info(f"Challenge page detected for {domain} — retrying with Playwright")
+        return _scrape_with_playwright(url)
 
     # ── Layer 1: Shopify JSON API (best quality, no JS needed) ───────────────
     shopify_data = _try_shopify_json(url, session)
@@ -220,9 +226,24 @@ def scrape_product_page(url: str) -> dict:
     for tag in soup.find_all(NOISE_TAGS):
         tag.decompose()
 
+    title = _extract_title(soup)
+
+    # ── Layer 4: Playwright fallback for JS-rendered product pages ────────────
+    # If we couldn't find a title on a /products/ URL the page is almost
+    # certainly a React/SPA store where the product name is injected by JS
+    # (common on Shopify stores whose JSON API is CDN-blocked).
+    # Re-render with Playwright rather than save a useless "Unknown" card.
+    if title == "Unknown Product" and "/products/" in urlparse(url).path:
+        logger.info(f"Title unknown on {domain} product URL — retrying with Playwright")
+        try:
+            return _scrape_with_playwright(url)
+        except ValueError as e:
+            logger.warning(f"Playwright fallback also failed: {e}")
+            # Fall through to whatever HTML gave us
+
     return {
         "url": url,
-        "title": _extract_title(soup),
+        "title": title,
         "price": _extract_price(soup, response.text),
         "description": _extract_description(soup),
         "cta_buttons": _extract_cta_buttons(soup, url),
@@ -244,13 +265,35 @@ def _try_shopify_json(url: str, session: requests.Session) -> Optional[dict]:
 
     # Build the JSON endpoint URL
     # /collections/foo/products/handle → /products/handle.json
-    handle = parsed.path.rstrip("/").split("/products/")[-1].split("?")[0]
-    json_url = f"{parsed.scheme}://{parsed.netloc}/products/{handle}.json"
+    # Try three handle forms in order:
+    #   1. Raw (as-is from URL path, may be percent-encoded)
+    #   2. URL-decoded  (e.g. "platinum%C2%AE-..." → "platinum®-...")
+    #   3. ASCII-only   (e.g. "platinum®-..." → "platinum-...") ← Shopify's actual slug
+    raw_handle = parsed.path.rstrip("/").split("/products/")[-1].split("?")[0]
+    decoded_handle = unquote(raw_handle)
+    ascii_handle = re.sub(r"[^a-z0-9]+", "-", decoded_handle.lower()).strip("-")
+
+    handle_candidates: list[str] = [raw_handle]
+    if decoded_handle != raw_handle:
+        handle_candidates.append(decoded_handle)
+    if ascii_handle not in handle_candidates:
+        handle_candidates.append(ascii_handle)
+
+    resp = None
+    for h in handle_candidates:
+        json_url = f"{parsed.scheme}://{parsed.netloc}/products/{h}.json"
+        try:
+            r = session.get(json_url, timeout=10)
+            if r.status_code == 200:
+                resp = r
+                break
+        except Exception:
+            continue
+
+    if resp is None:
+        return None
 
     try:
-        resp = session.get(json_url, timeout=10)
-        if resp.status_code != 200:
-            return None
         data = resp.json().get("product", {})
     except Exception:
         return None
@@ -509,3 +552,146 @@ def _get_clean_text(soup: BeautifulSoup) -> str:
                 return text
 
     return soup.get_text(separator="\n", strip=True)
+
+
+def _playwright_fetch_html(url: str) -> str:
+    """
+    Fetch fully-rendered HTML using a stealth Chromium browser.
+
+    This MUST run in a worker thread — Playwright's sync API raises an error
+    when called from inside a running asyncio event loop (e.g. FastAPI).
+    ThreadPoolExecutor gives it a clean thread with no event loop.
+
+    On Windows, worker threads default to SelectorEventLoop which can't launch
+    subprocesses. We explicitly set ProactorEventLoop before Playwright starts.
+    """
+    if sys.platform == "win32":
+        # Uvicorn on Windows sets WindowsSelectorEventLoopPolicy globally for compatibility.
+        # Playwright calls asyncio.new_event_loop() internally, which creates a loop using
+        # the active POLICY — still SelectorEventLoop, which can't spawn subprocesses.
+        # We override the policy so new_event_loop() returns ProactorEventLoop instead.
+        # This is safe: the main uvicorn loop is already running and won't be recreated.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    from playwright.sync_api import sync_playwright
+    from playwright_stealth import Stealth
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",           # required in Docker/rootless containers
+                "--disable-dev-shm-usage",  # use /tmp instead of /dev/shm (64MB in containers → OOM)
+                "--disable-gpu",          # no GPU in headless servers
+                "--single-process",       # saves ~100 MB vs multi-process mode
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=HEADERS["User-Agent"],
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.new_page()
+        # Patch ~30 fingerprint signals before navigation
+        Stealth().apply_stealth_sync(page)
+        try:
+            # "load" fires after main resources are fetched.
+            # Cloudflare challenges redirect to the real page within ~2s after load,
+            # so we add an extra wait to let that redirect + page render complete.
+            # We avoid "networkidle" because e-commerce sites have continuous
+            # background telemetry that prevents it from ever firing.
+            logger.info(f"Playwright: navigating to {url}")
+            page.goto(url, wait_until="load", timeout=30000)
+            logger.info("Playwright: page loaded, waiting 3s for JS/challenge redirect")
+            page.wait_for_timeout(3000)
+            html = page.content()
+            logger.info(f"Playwright: got {len(html)} chars")
+        except Exception:
+            logger.error(f"Playwright page error:\n{traceback.format_exc()}")
+            raise
+        finally:
+            browser.close()
+
+    return html
+
+
+def _scrape_with_playwright(url: str) -> dict:
+    """
+    Launch a stealth Chromium browser to render JS-heavy or bot-protected pages.
+
+    Runs the browser in a ThreadPoolExecutor to avoid the asyncio event loop
+    conflict that Playwright's sync API raises inside FastAPI routes.
+    """
+    try:
+        import playwright  # noqa: F401 — verify installed before spinning up thread
+        from playwright_stealth import Stealth  # noqa: F401
+    except ImportError:
+        raise ValueError(
+            "Playwright is not installed. Run: "
+            "pip install playwright playwright-stealth && playwright install chromium"
+        )
+
+    domain = urlparse(url).netloc
+    logger.info(f"Playwright launching for {domain}")
+
+    # Run in a worker thread — threads have no asyncio loop, so sync_playwright works
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_playwright_fetch_html, url)
+        try:
+            html = future.result(timeout=60)
+        except concurrent.futures.TimeoutError:
+            raise ValueError(f"Playwright timed out after 60s for {url}")
+        except Exception as e:
+            logger.error(f"Playwright thread exception:\n{traceback.format_exc()}")
+            raise ValueError(f"Playwright failed for {url}: {type(e).__name__}: {e}")
+
+    logger.info(f"Playwright fetched {len(html)} chars from {domain}")
+
+    # ── Post-render challenge check ───────────────────────────────────────────
+    # If the rendered page is still a bot-protection screen (Akamai, Cloudflare
+    # Enterprise), raise now rather than sending a useless block page to Groq.
+    if _is_challenge_page(html):
+        raise ValueError(
+            f"{domain} returned a bot-protection block page even after Playwright stealth. "
+            "This site likely uses Akamai Bot Manager. A commercial scraping proxy "
+            "(ScraperAPI, Bright Data, Zyte API) is required to bypass it."
+        )
+    # Size sanity-check: a real product page is 50 KB+; block pages are <5 KB.
+    if len(html) < 5000:
+        raise ValueError(
+            f"{domain} returned only {len(html):,} chars after rendering — "
+            "looks like a bot-protection block page. "
+            "A commercial scraping proxy may be required."
+        )
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # ── Layer 1: Shopify JSON still works via requests even on protected sites ─
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    shopify_data = _try_shopify_json(url, session)
+    if shopify_data:
+        logger.info(f"Playwright fallback → Shopify JSON: {shopify_data['title']}")
+        return {**shopify_data, "_source": "playwright+shopify_json"}
+
+    # ── Layer 2: JSON-LD from the now-rendered page ───────────────────────────
+    jsonld_data = _try_jsonld(soup, url)
+    if jsonld_data:
+        logger.info(f"Playwright + JSON-LD: {jsonld_data['title']}")
+        return {**jsonld_data, "_source": "playwright_jsonld"}
+
+    # ── Layer 3: HTML parsing of rendered page ────────────────────────────────
+    for tag in soup.find_all(NOISE_TAGS):
+        tag.decompose()
+
+    return {
+        "url": url,
+        "title": _extract_title(soup),
+        "price": _extract_price(soup, html),
+        "description": _extract_description(soup),
+        "cta_buttons": _extract_cta_buttons(soup, url),
+        "review_snippets": _extract_reviews(soup),
+        "raw_text": _get_clean_text(soup)[:5000],
+        "_source": "playwright_html",
+    }

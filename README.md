@@ -5,6 +5,10 @@
 
 ---
 
+
+
+---
+
 ## What it does
 
 | Step | What happens |
@@ -44,6 +48,10 @@ cp .env.example .env
 # Edit .env: add GROQ_API_KEY and DATABASE_URL
 
 pip install -r requirements.txt
+
+# Install Playwright's Chromium browser (needed for bot-protected sites)
+playwright install chromium
+
 uvicorn main:app --reload --port 8000
 ```
 
@@ -114,7 +122,7 @@ docker-compose up --build
 ```bash
 curl -X POST http://localhost:8000/scrape \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/product/sneakers"}'
+  -d '{"url": "https://www.allbirds.com/products/mens-wool-runners"}'
 ```
 
 ### Example: Run the comparison
@@ -192,7 +200,7 @@ Edit the prompt to change what fields the LLM extracts. For example, you could a
 
 ## Next Steps / Extensions
 
-- [ ] Playwright scraper for JS-heavy pages (SPAs)
+- [x] Playwright scraper for JS-heavy pages (SPAs) — stealth Chromium, auto-fallback on 403/Cloudflare challenge
 - [ ] Batch scraping: accept a CSV of URLs
 - [ ] Auto-refresh: re-scrape on a schedule (price changes, stock changes)
 - [ ] Embed summaries into a vector DB for semantic product search

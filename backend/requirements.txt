@@ -9,3 +9,5 @@ sqlalchemy==2.0.23
 python-dotenv==1.0.0
 pydantic>=2.7.0
 httpx==0.25.2
+playwright>=1.40.0
+playwright-stealth>=1.0.6
