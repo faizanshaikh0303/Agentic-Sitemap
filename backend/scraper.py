@@ -11,25 +11,42 @@ that an LLM can quickly reason about.
 import re
 import logging
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+# Sites known to use aggressive bot protection (Akamai, Cloudflare Enterprise, etc.)
+# These return 403/429 regardless of headers — Playwright with stealth is required.
+PROTECTED_DOMAINS = {
+    "adidas.com", "www.adidas.com",
+    "supreme.com", "www.supreme.com",
+    "ticketmaster.com", "www.ticketmaster.com",
+}
+
+# Full Chrome 120 header set — modern browsers send all of these.
+# Sec-Fetch-* headers are the most commonly checked by bot detectors.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-CH-UA": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "Cache-Control": "max-age=0",
 }
 
 # Tags to remove — these are noise for an LLM
@@ -95,13 +112,38 @@ def scrape_product_page(url: str) -> dict:
     Fetch and parse a product/shoppable page.
     Returns a structured dict with high-signal fields only.
     """
+    domain = urlparse(url).netloc
+    if domain in PROTECTED_DOMAINS:
+        raise ValueError(
+            f"{domain} uses enterprise bot protection (Akamai/Cloudflare) that blocks "
+            "all HTTP scrapers. Use Playwright with a stealth plugin for this site, "
+            "or manually paste the product data."
+        )
+
+    # Session persists cookies across redirects (e.g. consent pages)
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    # Add a Referer that looks like a Google search referral
+    session.headers["Referer"] = "https://www.google.com/"
+
     try:
-        response = requests.get(url, headers=HEADERS, timeout=20)
+        response = session.get(url, timeout=20, allow_redirects=True)
         response.raise_for_status()
     except requests.Timeout:
         raise ValueError(f"Request timed out for {url}")
     except requests.HTTPError as e:
-        raise ValueError(f"HTTP {e.response.status_code} fetching {url}")
+        status = e.response.status_code
+        if status == 403:
+            raise ValueError(
+                f"403 Forbidden — {domain} is blocking automated requests. "
+                "This site likely uses bot protection (Cloudflare, Akamai, etc.). "
+                "Try a different product URL, or use Playwright for JS-heavy sites."
+            )
+        if status == 429:
+            raise ValueError(
+                f"429 Too Many Requests — {domain} is rate-limiting. Wait a moment and retry."
+            )
+        raise ValueError(f"HTTP {status} fetching {url}")
     except requests.RequestException as e:
         raise ValueError(f"Could not fetch URL: {e}")
 
