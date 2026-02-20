@@ -12,7 +12,16 @@ DATABASE_URL = os.getenv(
     "postgresql://postgres:password@localhost:5432/agentic_sitemap"
 )
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    # pool_pre_ping sends a lightweight SELECT 1 before each connection use.
+    # This detects stale connections (e.g. after Neon serverless auto-suspend)
+    # and transparently reconnects instead of crashing with SSL/OperationalError.
+    pool_pre_ping=True,
+    # Recycle connections after 5 minutes so the pool never holds a connection
+    # longer than Neon's idle timeout (300s default).
+    pool_recycle=300,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
