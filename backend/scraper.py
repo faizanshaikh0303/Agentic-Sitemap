@@ -25,6 +25,27 @@ PROTECTED_DOMAINS = {
     "adidas.com", "www.adidas.com",
     "supreme.com", "www.supreme.com",
     "ticketmaster.com", "www.ticketmaster.com",
+    "reebok.com", "www.reebok.com",
+}
+
+# Strings that indicate a Cloudflare / bot-protection interstitial page.
+# These pages return HTTP 200 but contain no product data at all — detecting
+# them early prevents silently saving a useless "Unknown" card to the DB.
+_CHALLENGE_MARKERS = [
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "cf_chl_prog",
+    "__cf_chl_tk__",
+    "DDoS protection by Cloudflare",
+    "Checking if the site connection is secure",
+]
+_CHALLENGE_TITLES = {
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "please wait",
+    "security check",
+    "one moment, please",
 }
 
 # Full Chrome 120 header set — modern browsers send all of these.
@@ -109,6 +130,33 @@ TITLE_SELECTORS = [
 ]
 
 
+def _assert_not_challenge(html: str, domain: str) -> None:
+    """
+    Raise ValueError if the response looks like a bot-protection interstitial.
+    Cloudflare JS challenges return HTTP 200 with no product data — if we don't
+    catch this, all three extraction layers silently return nothing and we save
+    a useless 'Unknown' card to the database.
+    """
+    # Quick marker scan (fast, no parsing needed)
+    for marker in _CHALLENGE_MARKERS:
+        if marker in html:
+            raise ValueError(
+                f"{domain} returned a Cloudflare bot-challenge page (HTTP 200 with "
+                "no product data). The site requires a real browser to pass the "
+                "JavaScript challenge. Use Playwright for this site."
+            )
+
+    # Page title check — parse only the <title> tag, very cheap
+    title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+    if title_match:
+        page_title = title_match.group(1).strip().lower()
+        if any(ct in page_title for ct in _CHALLENGE_TITLES):
+            raise ValueError(
+                f"{domain} returned a bot-challenge page titled '{title_match.group(1).strip()}'. "
+                "This site requires JavaScript execution. Use Playwright."
+            )
+
+
 def scrape_product_page(url: str) -> dict:
     """
     Fetch and parse a product/shoppable page.
@@ -148,6 +196,11 @@ def scrape_product_page(url: str) -> dict:
         raise ValueError(f"HTTP {status} fetching {url}")
     except requests.RequestException as e:
         raise ValueError(f"Could not fetch URL: {e}")
+
+    # ── Challenge page detection (HTTP 200 but no real content) ──────────────
+    # Cloudflare JS challenges return 200 with an interstitial, not product HTML.
+    # Detect before any extraction layer so we fail fast with a clear message.
+    _assert_not_challenge(response.text, domain)
 
     # ── Layer 1: Shopify JSON API (best quality, no JS needed) ───────────────
     shopify_data = _try_shopify_json(url, session)
