@@ -209,14 +209,21 @@ def _try_shopify_json(url: str, session: requests.Session) -> Optional[dict]:
     if not title:
         return None
 
-    # Price: use lowest variant price (the "from" price shown on PDP)
     variants = data.get("variants", [])
+
+    # Price: use the most common/regular price, not just the minimum
+    # (min price can be a sale outlier; modal price is more representative)
     price = None
     if variants:
-        prices = [float(v["price"]) for v in variants if v.get("price")]
-        if prices:
-            min_price = min(prices)
-            price = f"${min_price:.2f}" if min_price != int(min_price) else f"${int(min_price)}"
+        all_prices = [float(v["price"]) for v in variants if v.get("price")]
+        compare_prices = [float(v["compare_at_price"]) for v in variants if v.get("compare_at_price")]
+        if all_prices:
+            # Prefer compare_at_price (original price) when on sale, else modal price
+            if compare_prices:
+                ref = max(set(compare_prices), key=compare_prices.count)
+            else:
+                ref = max(set(all_prices), key=all_prices.count)  # most common = regular price
+            price = f"${ref:.2f}".replace(".00", "") if ref != int(ref) else f"${int(ref)}"
 
     # Strip HTML from body_html description
     body_html = data.get("body_html", "")
@@ -226,10 +233,30 @@ def _try_shopify_json(url: str, session: requests.Session) -> Optional[dict]:
     available = any(v.get("available", False) for v in variants)
     stock_status = "in_stock" if available else "out_of_stock"
 
-    # Build clean text for the LLM from all available fields
-    tags = ", ".join(data.get("tags", []))
+    # Extract option names + values (Color, Size, Style, etc.)
+    options = data.get("options", [])
+    option_lines = []
+    for opt in options:
+        name = opt.get("name", "")
+        values = opt.get("values", [])
+        if name and values:
+            option_lines.append(f"{name}: {', '.join(str(v) for v in values[:8])}")
+
+    # Build a rich context block — every field helps the LLM generate a better summary
+    vendor = data.get("vendor", "")
     product_type = data.get("product_type", "")
-    raw_text = f"Product: {title}\nType: {product_type}\nTags: {tags}\nDescription: {description}"
+    tags = ", ".join(data.get("tags", []))
+
+    raw_text = "\n".join(filter(None, [
+        f"Product: {title}",
+        f"Brand: {vendor}" if vendor else "",
+        f"Type: {product_type}" if product_type else "",
+        f"Price: {price}" if price else "",
+        f"Stock: {stock_status}",
+        "\n".join(option_lines) if option_lines else "",
+        f"Tags: {tags}" if tags else "",
+        f"Description: {description}" if description else "",
+    ]))
 
     return {
         "url": url,

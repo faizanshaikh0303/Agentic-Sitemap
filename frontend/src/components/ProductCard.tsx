@@ -45,7 +45,7 @@ export default function ProductCard({ product, onDelete, onRescrape }: ProductCa
   const sentimentColor =
     SENTIMENT_COLORS[(s.sentiment as string) ?? "neutral"] ?? SENTIMENT_COLORS.neutral;
   const confidence = typeof s.confidence === "number" ? s.confidence : 0.5;
-  const isStale = confidence < 0.3 || !(s.title as string);
+  const isStale = confidence < 0.15 || !(s.title as string);
 
   const handleDelete = async () => {
     setState("deleting");
