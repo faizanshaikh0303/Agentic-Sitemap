@@ -1,11 +1,12 @@
 /** @type {import('next').NextConfig} */
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
 const nextConfig = {
-  // Allow the frontend to call the Python backend on localhost:8000
   async rewrites() {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/:path*",
+        destination: `${BACKEND}/:path*`,
       },
     ];
   },
