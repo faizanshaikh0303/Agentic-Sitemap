@@ -31,10 +31,13 @@ interface ProductCardProps {
     summary?: Record<string, unknown>;
   };
   onDelete: () => void;
+  onRescrape: () => void;
 }
 
-export default function ProductCard({ product, onDelete }: ProductCardProps) {
-  const [deleting, setDeleting] = useState(false);
+type CardState = "idle" | "scraping" | "deleting";
+
+export default function ProductCard({ product, onDelete, onRescrape }: ProductCardProps) {
+  const [state, setState] = useState<CardState>("idle");
   const s = (product.summary ?? {}) as Record<string, string | number>;
 
   const stockStyle =
@@ -42,19 +45,52 @@ export default function ProductCard({ product, onDelete }: ProductCardProps) {
   const sentimentColor =
     SENTIMENT_COLORS[(s.sentiment as string) ?? "neutral"] ?? SENTIMENT_COLORS.neutral;
   const confidence = typeof s.confidence === "number" ? s.confidence : 0.5;
+  const isStale = confidence < 0.3 || !(s.title as string);
 
   const handleDelete = async () => {
-    setDeleting(true);
+    setState("deleting");
     try {
       await fetch(`/api/products/${product.id}`, { method: "DELETE" });
       onDelete();
     } catch {
-      setDeleting(false);
+      setState("idle");
+    }
+  };
+
+  const handleRescrape = async () => {
+    setState("scraping");
+    try {
+      const res = await fetch("/api/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: product.url, force_refresh: true }),
+      });
+      if (res.ok) {
+        onRescrape();
+      }
+    } finally {
+      setState("idle");
     }
   };
 
   return (
-    <div className="bg-gray-900 border border-gray-800 hover:border-gray-600 rounded-xl p-5 flex flex-col gap-3 transition-colors group">
+    <div className={`bg-gray-900 border rounded-xl p-5 flex flex-col gap-3 transition-colors group ${
+      isStale ? "border-yellow-800/60" : "border-gray-800 hover:border-gray-600"
+    }`}>
+      {/* Stale data warning */}
+      {isStale && (
+        <div className="flex items-center justify-between bg-yellow-900/30 border border-yellow-800/50 rounded-lg px-3 py-2">
+          <p className="text-xs text-yellow-400">Low confidence — click Re-scrape to refresh</p>
+          <button
+            onClick={handleRescrape}
+            disabled={state !== "idle"}
+            className="text-xs text-yellow-300 hover:text-white bg-yellow-800/50 hover:bg-yellow-700/60 px-2 py-1 rounded transition-colors disabled:opacity-40 shrink-0 ml-2"
+          >
+            {state === "scraping" ? "Scraping…" : "Re-scrape"}
+          </button>
+        </div>
+      )}
+
       {/* Title + stock badge */}
       <div className="flex items-start justify-between gap-2">
         <h3 className="font-semibold text-white text-sm leading-snug line-clamp-2">
@@ -117,18 +153,29 @@ export default function ProductCard({ product, onDelete }: ProductCardProps) {
           href={product.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-xs text-blue-400 hover:text-blue-300 truncate max-w-[180px] transition-colors"
+          className="text-xs text-blue-400 hover:text-blue-300 truncate max-w-[140px] transition-colors"
           title={product.url}
         >
           {safeHostname(product.url)}
         </a>
-        <button
-          onClick={handleDelete}
-          disabled={deleting}
-          className="text-xs text-gray-600 hover:text-red-400 transition-colors disabled:opacity-40"
-        >
-          {deleting ? "removing…" : "remove"}
-        </button>
+        <div className="flex items-center gap-3">
+          {!isStale && (
+            <button
+              onClick={handleRescrape}
+              disabled={state !== "idle"}
+              className="text-xs text-gray-500 hover:text-gray-300 transition-colors disabled:opacity-40"
+            >
+              {state === "scraping" ? "scraping…" : "re-scrape"}
+            </button>
+          )}
+          <button
+            onClick={handleDelete}
+            disabled={state !== "idle"}
+            className="text-xs text-gray-600 hover:text-red-400 transition-colors disabled:opacity-40"
+          >
+            {state === "deleting" ? "removing…" : "remove"}
+          </button>
+        </div>
       </div>
     </div>
   );

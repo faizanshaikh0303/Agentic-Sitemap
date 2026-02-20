@@ -174,6 +174,7 @@ export default function Home() {
                     <ProductCard
                       key={product.id}
                       product={product}
+                      onRescrape={fetchProducts}
                       onDelete={fetchProducts}
                     />
                   ))}
